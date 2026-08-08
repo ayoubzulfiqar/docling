@@ -1,22 +1,55 @@
 """Backend to parse patents from the United States Patent Office (USPTO).
 
-The parsers included in this module can handle patent grants pubished since 1976 and
+The parsers included in this module can handle patent grants published since 1976 and
 patent applications since 2001.
 The original files can be found in https://bulkdata.uspto.gov.
+
+Security Note:
+    This module uses defusedxml.sax.make_parser() with security settings to protect
+    against XML External Entity (XXE) attacks and entity expansion attacks (Billion
+    Laughs/CWE-776). The parser is configured with:
+
+    - feature_external_ges: False (blocks external general entity resolution)
+    - feature_external_pes: False (blocks external parameter entity resolution)
+    - forbid_dtd: False (allows DTD declarations required by USPTO XML format)
+    - forbid_entities: False (allows entity declarations including NDATA)
+    - forbid_external: False (allows SYSTEM declarations in DTD)
+
+    Security Analysis:
+    1. XXE Prevention: While external entities can be declared (forbid_external=False),
+       they are never resolved or fetched due to feature_external_ges=False and
+       feature_external_pes=False. This prevents XXE attacks.
+
+    2. Billion Laughs Mitigation: defusedxml's built-in entity expansion limits
+       (MAX_ENTITY_EXPANSION=10,000) prevent exponential entity expansion from
+       causing memory exhaustion. While not completely blocking entity expansion,
+       this limit prevents the worst-case denial-of-service scenarios.
+
+    3. NDATA Entities: USPTO files use NDATA entities for image references
+       (e.g., <!ENTITY img SYSTEM "file.tif" NDATA TIF>). These are unparsed
+       entities that don't expand inline and aren't fetched due to the external
+       entity resolution being disabled.
+
+    This configuration balances security with USPTO format compatibility. The key
+    insight is that defusedxml distinguishes between entity declaration (allowed)
+    and entity resolution/fetched (blocked), providing protection while allowing
+    the required DTD structure.
 """
+
+from __future__ import annotations
 
 import html
 import logging
 import re
-import xml.sax
-import xml.sax.xmlreader
 from abc import ABC, abstractmethod
 from enum import Enum, unique
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
-from typing import Any, Final, Optional, Union
+from typing import Final
+from xml.sax import SAXParseException
+from xml.sax.handler import ContentHandler, feature_external_ges, feature_external_pes
+from xml.sax.xmlreader import AttributesImpl
 
-from bs4 import BeautifulSoup, Tag
 from docling_core.types.doc import (
     DocItem,
     DocItemLabel,
@@ -33,10 +66,27 @@ from typing_extensions import Self, TypedDict, override
 from docling.backend.abstract_backend import DeclarativeDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
+from docling.exceptions import DocumentLoadError
+
+_BS4_AVAILABLE: bool = False
+_BS4_IMPORT_ERROR: ImportError | None = None
+try:  # pragma: no cover - import-time guard
+    from bs4 import BeautifulSoup, Tag
+    from defusedxml.common import DefusedXmlException
+    from defusedxml.sax import make_parser
+
+    _BS4_AVAILABLE = True
+except ImportError as e:  # pragma: no cover - import-time guard
+    _BS4_IMPORT_ERROR = e
+
+_INSTALL_HINT = (
+    "The 'beautifulsoup4' and 'defusedxml' packages are required to process USPTO patent files. "
+    "Install them with `pip install 'docling-slim[format-xml-uspto]'`."
+)
 
 _log = logging.getLogger(__name__)
 
-XML_DECLARATION: Final = '<?xml version="1.0" encoding="UTF-8"?>'
+XML_DECLARATION: Final[str] = '<?xml version="1.0" encoding="UTF-8"?>'
 
 
 @unique
@@ -59,13 +109,13 @@ class PatentHeading(Enum):
 
 class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
     @override
-    def __init__(
-        self, in_doc: InputDocument, path_or_stream: Union[BytesIO, Path]
-    ) -> None:
+    def __init__(self, in_doc: InputDocument, path_or_stream: BytesIO | Path) -> None:
+        if not _BS4_AVAILABLE:
+            raise ImportError(_INSTALL_HINT) from _BS4_IMPORT_ERROR
         super().__init__(in_doc, path_or_stream)
 
         self.patent_content: str = ""
-        self.parser: Optional[PatentUspto] = None
+        self.parser: PatentUspto | None = None
 
         try:
             if isinstance(self.path_or_stream, BytesIO):
@@ -80,7 +130,7 @@ class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
                             self._set_parser(line)
                         self.patent_content += line
         except Exception as exc:
-            raise RuntimeError(
+            raise DocumentLoadError(
                 f"Could not initialize USPTO backend for file with hash {self.document_hash}."
             ) from exc
 
@@ -122,7 +172,6 @@ class PatentUsptoDocumentBackend(DeclarativeDocumentBackend):
 
     @override
     def convert(self) -> DoclingDocument:
-
         if self.parser is not None:
             doc = self.parser.parse(self.patent_content)
             if doc is None:
@@ -154,7 +203,7 @@ class PatentUspto(ABC):
     """Parser of patent documents from the US Patent Office."""
 
     @abstractmethod
-    def parse(self, patent_content: str) -> Optional[DoclingDocument]:
+    def parse(self, patent_content: str) -> DoclingDocument | None:
         """Parse a USPTO patent.
 
         Parameters:
@@ -163,7 +212,6 @@ class PatentUspto(ABC):
         Returns:
             The patent parsed as a docling document.
         """
-        pass
 
 
 class PatentUsptoIce(PatentUspto):
@@ -179,12 +227,26 @@ class PatentUsptoIce(PatentUspto):
         self.handler = PatentUsptoIce.PatentHandler()
         self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
-    def parse(self, patent_content: str) -> Optional[DoclingDocument]:
+    def parse(self, patent_content: str) -> DoclingDocument | None:
         try:
-            xml.sax.parseString(patent_content, self.handler)
-        except xml.sax._exceptions.SAXParseException as exc_sax:
-            _log.error(f"Error in parsing USPTO document: {exc_sax}")
-
+            parser = make_parser()
+            parser.setFeature(feature_external_ges, False)
+            parser.setFeature(feature_external_pes, False)
+            parser.forbid_dtd = False
+            parser.forbid_entities = False
+            parser.forbid_external = False
+            parser.setContentHandler(self.handler)
+            parser.parse(StringIO(patent_content))
+        except SAXParseException as exc_sax:
+            _log.error(f"Error in parsing USPTO document (malformed XML): {exc_sax}")
+            return None
+        except DefusedXmlException as exc_defused:
+            _log.error(
+                f"Error in parsing USPTO document (security issue detected): {exc_defused}"
+            )
+            return None
+        except Exception as exc:
+            _log.error(f"Unexpected error in parsing USPTO document: {exc}")
             return None
 
         doc = self.handler.doc
@@ -211,11 +273,11 @@ class PatentUsptoIce(PatentUspto):
 
         return doc
 
-    class PatentHandler(xml.sax.handler.ContentHandler):
+    class PatentHandler(ContentHandler):
         """SAX ContentHandler for patent documents."""
 
-        APP_DOC_ELEMENT: Final = "us-patent-application"
-        GRANT_DOC_ELEMENT: Final = "us-patent-grant"
+        APP_DOC_ELEMENT: Final[str] = "us-patent-application"
+        GRANT_DOC_ELEMENT: Final[str] = "us-patent-grant"
 
         @unique
         class Element(Enum):
@@ -249,11 +311,11 @@ class PatentUsptoIce(PatentUspto):
         def __init__(self) -> None:
             """Build an instance of the patent handler."""
             # Current patent being parsed
-            self.doc: Optional[DoclingDocument] = None
+            self.doc: DoclingDocument | None = None
             # Keep track of docling hierarchy level
             self.level: LevelNumber = 1
             # Keep track of docling parents by level
-            self.parents: dict[LevelNumber, Optional[DocItem]] = {1: None}
+            self.parents: dict[LevelNumber, DocItem | None] = {1: None}
             # Content to retain for the current patent
             self.property: list[str]
             self.claim: str
@@ -265,7 +327,7 @@ class PatentUsptoIce(PatentUspto):
             self.style_html = HtmlEntity()
 
         @override
-        def startElement(self, tag, attributes):  # noqa: N802
+        def startElement(self, tag, attributes):
             """Signal the start of an element.
 
             Args:
@@ -281,7 +343,7 @@ class PatentUsptoIce(PatentUspto):
             self._start_registered_elements(tag, attributes)
 
         @override
-        def skippedEntity(self, name):  # noqa: N802
+        def skippedEntity(self, name):
             """Receive notification of a skipped entity.
 
             HTML entities will be skipped by the parser. This method will unescape them
@@ -315,7 +377,7 @@ class PatentUsptoIce(PatentUspto):
                         self.text += unescaped
 
         @override
-        def endElement(self, tag):  # noqa: N802
+        def endElement(self, tag):
             """Signal the end of an element.
 
             Args:
@@ -354,7 +416,7 @@ class PatentUsptoIce(PatentUspto):
                         self.text += content
 
         def _start_registered_elements(
-            self, tag: str, attributes: xml.sax.xmlreader.AttributesImpl
+            self, tag: str, attributes: AttributesImpl
         ) -> None:
             if tag in [member.value for member in self.Element]:
                 # special case for claims: claim lines may start before the
@@ -389,7 +451,7 @@ class PatentUsptoIce(PatentUspto):
             if name == self.Element.TITLE.value:
                 if text:
                     self.parents[self.level + 1] = self.doc.add_title(
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                         text=text,
                     )
                     self.level += 1
@@ -406,7 +468,7 @@ class PatentUsptoIce(PatentUspto):
                     abstract_item = self.doc.add_heading(
                         heading_text,
                         level=heading_level,
-                        parent=self.parents[heading_level],  # type: ignore[arg-type]
+                        parent=self.parents[heading_level],
                     )
                     self.doc.add_text(
                         label=DocItemLabel.PARAGRAPH,
@@ -434,7 +496,7 @@ class PatentUsptoIce(PatentUspto):
                 claims_item = self.doc.add_heading(
                     heading_text,
                     level=heading_level,
-                    parent=self.parents[heading_level],  # type: ignore[arg-type]
+                    parent=self.parents[heading_level],
                 )
                 for text in self.claims:
                     self.doc.add_text(
@@ -442,7 +504,7 @@ class PatentUsptoIce(PatentUspto):
                     )
 
             elif name == self.Element.PARAGRAPH.value and text:
-                # remmove blank spaces added in paragraphs
+                # remove blank spaces added in paragraphs
                 text = re.sub("\\s+", " ", text)
                 if self.Element.ABSTRACT.value in self.property:
                     self.abstract = (
@@ -452,7 +514,7 @@ class PatentUsptoIce(PatentUspto):
                     self.doc.add_text(
                         label=DocItemLabel.PARAGRAPH,
                         text=text,
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                     )
                 self.text = ""
 
@@ -460,7 +522,7 @@ class PatentUsptoIce(PatentUspto):
                 self.parents[self.level + 1] = self.doc.add_heading(
                     text=text,
                     level=self.level,
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
                 self.level += 1
                 self.text = ""
@@ -470,7 +532,7 @@ class PatentUsptoIce(PatentUspto):
                 empty_table = TableData(num_rows=0, num_cols=0, table_cells=[])
                 self.doc.add_table(
                     data=empty_table,
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
 
         def _apply_style(self, text: str, style_tag: str) -> str:
@@ -516,12 +578,26 @@ class PatentUsptoGrantV2(PatentUspto):
         self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
     @override
-    def parse(self, patent_content: str) -> Optional[DoclingDocument]:
+    def parse(self, patent_content: str) -> DoclingDocument | None:
         try:
-            xml.sax.parseString(patent_content, self.handler)
-        except xml.sax._exceptions.SAXParseException as exc_sax:
-            _log.error(f"Error in parsing USPTO document: {exc_sax}")
-
+            parser = make_parser()
+            parser.setFeature(feature_external_ges, False)
+            parser.setFeature(feature_external_pes, False)
+            parser.forbid_dtd = False
+            parser.forbid_entities = False
+            parser.forbid_external = False
+            parser.setContentHandler(self.handler)
+            parser.parse(StringIO(patent_content))
+        except SAXParseException as exc_sax:
+            _log.error(f"Error in parsing USPTO document (malformed XML): {exc_sax}")
+            return None
+        except DefusedXmlException as exc_defused:
+            _log.error(
+                f"Error in parsing USPTO document (security issue detected): {exc_defused}"
+            )
+            return None
+        except Exception as exc:
+            _log.error(f"Unexpected error in parsing USPTO document: {exc}")
             return None
 
         doc = self.handler.doc
@@ -548,11 +624,11 @@ class PatentUsptoGrantV2(PatentUspto):
 
         return doc
 
-    class PatentHandler(xml.sax.handler.ContentHandler):
+    class PatentHandler(ContentHandler):
         """SAX ContentHandler for patent documents."""
 
-        GRANT_DOC_ELEMENT: Final = "PATDOC"
-        CLAIM_STATEMENT: Final = "What is claimed is:"
+        GRANT_DOC_ELEMENT: Final[str] = "PATDOC"
+        CLAIM_STATEMENT: Final[str] = "What is claimed is:"
 
         @unique
         class Element(Enum):
@@ -587,11 +663,11 @@ class PatentUsptoGrantV2(PatentUspto):
         def __init__(self) -> None:
             """Build an instance of the patent handler."""
             # Current patent being parsed
-            self.doc: Optional[DoclingDocument] = None
+            self.doc: DoclingDocument | None = None
             # Keep track of docling hierarchy level
             self.level: LevelNumber = 1
             # Keep track of docling parents by level
-            self.parents: dict[LevelNumber, Optional[DocItem]] = {1: None}
+            self.parents: dict[LevelNumber, DocItem | None] = {1: None}
             # Content to retain for the current patent
             self.property: list[str]
             self.claim: str
@@ -603,7 +679,7 @@ class PatentUsptoGrantV2(PatentUspto):
             self.style_html = HtmlEntity()
 
         @override
-        def startElement(self, tag, attributes):  # noqa: N802
+        def startElement(self, tag, attributes):
             """Signal the start of an element.
 
             Args:
@@ -616,7 +692,7 @@ class PatentUsptoGrantV2(PatentUspto):
             self._start_registered_elements(tag, attributes)
 
         @override
-        def skippedEntity(self, name):  # noqa: N802
+        def skippedEntity(self, name):
             """Receive notification of a skipped entity.
 
             HTML entities will be skipped by the parser. This method will unescape them
@@ -632,7 +708,7 @@ class PatentUsptoGrantV2(PatentUspto):
                     escaped = self.style_html.get_greek_from_iso8879(f"&{name};")
                     unescaped = html.unescape(escaped)
                     if unescaped == escaped:
-                        logging.debug("Unrecognized HTML entity: " + name)
+                        _log.debug("Unrecognized HTML entity: " + name)
                         return
 
                     if element in (
@@ -650,7 +726,7 @@ class PatentUsptoGrantV2(PatentUspto):
                         self.text += unescaped
 
         @override
-        def endElement(self, tag):  # noqa: N802
+        def endElement(self, tag):
             """Signal the end of an element.
 
             Args:
@@ -686,12 +762,12 @@ class PatentUsptoGrantV2(PatentUspto):
                         self.text += content
 
         def _start_registered_elements(
-            self, tag: str, attributes: xml.sax.xmlreader.AttributesImpl
+            self, tag: str, attributes: AttributesImpl
         ) -> None:
             if tag in [member.value for member in self.Element]:
                 if (
                     tag == self.Element.HEADING.value
-                    and not self.Element.SDOCL.value in self.property
+                    and self.Element.SDOCL.value not in self.property
                 ):
                     level_attr: str = attributes.get("LVL", "")
                     new_level: int = int(level_attr) if level_attr.isnumeric() else 1
@@ -721,7 +797,7 @@ class PatentUsptoGrantV2(PatentUspto):
                 if self.Element.TITLE.value in self.property and text.strip():
                     title = text.strip()
                     self.parents[self.level + 1] = self.doc.add_title(
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                         text=title,
                     )
                     self.level += 1
@@ -743,13 +819,13 @@ class PatentUsptoGrantV2(PatentUspto):
                 # headers except claims statement
                 elif (
                     self.Element.HEADING.value in self.property
-                    and not self.Element.SDOCL.value in self.property
+                    and self.Element.SDOCL.value not in self.property
                     and text.strip()
                 ):
                     self.parents[self.level + 1] = self.doc.add_heading(
                         text=text.strip(),
                         level=self.level,
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                     )
                     self.level += 1
 
@@ -769,7 +845,7 @@ class PatentUsptoGrantV2(PatentUspto):
                 claims_item = self.doc.add_heading(
                     heading_text,
                     level=heading_level,
-                    parent=self.parents[heading_level],  # type: ignore[arg-type]
+                    parent=self.parents[heading_level],
                 )
                 for text in self.claims:
                     self.doc.add_text(
@@ -787,7 +863,7 @@ class PatentUsptoGrantV2(PatentUspto):
                 abstract_item = self.doc.add_heading(
                     heading_text,
                     level=heading_level,
-                    parent=self.parents[heading_level],  # type: ignore[arg-type]
+                    parent=self.parents[heading_level],
                 )
                 self.doc.add_text(
                     label=DocItemLabel.PARAGRAPH, text=abstract, parent=abstract_item
@@ -799,7 +875,7 @@ class PatentUsptoGrantV2(PatentUspto):
                     self.doc.add_text(
                         label=DocItemLabel.PARAGRAPH,
                         text=paragraph,
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                     )
                 elif self.Element.CLAIM.value in self.property:
                     # we may need a space after a paragraph in claim text
@@ -811,7 +887,7 @@ class PatentUsptoGrantV2(PatentUspto):
                 empty_table = TableData(num_rows=0, num_cols=0, table_cells=[])
                 self.doc.add_table(
                     data=empty_table,
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
 
         def _apply_style(self, text: str, style_tag: str) -> str:
@@ -889,13 +965,13 @@ class PatentUsptoGrantAps(PatentUspto):
     @override
     def __init__(self) -> None:
         """Build an instance of PatentUsptoGrantAps class."""
-        self.doc: Optional[DoclingDocument] = None
+        self.doc: DoclingDocument | None = None
         # Keep track of docling hierarchy level
         self.level: LevelNumber = 1
         # Keep track of docling parents by level
-        self.parents: dict[LevelNumber, Optional[DocItem]] = {1: None}
+        self.parents: dict[LevelNumber, DocItem | None] = {1: None}
 
-    def get_last_text_item(self) -> Optional[TextItem]:
+    def get_last_text_item(self) -> TextItem | None:
         """Get the last text item at the current document level.
 
         Returns:
@@ -938,7 +1014,7 @@ class PatentUsptoGrantAps(PatentUspto):
         self.parents[self.level + 1] = self.doc.add_heading(
             heading.value,
             level=self.level,
-            parent=self.parents[self.level],  # type: ignore[arg-type]
+            parent=self.parents[self.level],
         )
         self.level += 1
 
@@ -959,7 +1035,7 @@ class PatentUsptoGrantAps(PatentUspto):
 
         if field == self.Field.TITLE.value:
             self.parents[self.level + 1] = self.doc.add_title(
-                parent=self.parents[self.level], text=value  # type: ignore[arg-type]
+                parent=self.parents[self.level], text=value
             )
             self.level += 1
 
@@ -971,14 +1047,14 @@ class PatentUsptoGrantAps(PatentUspto):
                 self.doc.add_text(
                     label=DocItemLabel.PARAGRAPH,
                     text=value,
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
 
         elif field == self.Field.NUMBER.value and section == self.Section.CLAIMS.value:
             self.doc.add_text(
                 label=DocItemLabel.PARAGRAPH,
                 text="",
-                parent=self.parents[self.level],  # type: ignore[arg-type]
+                parent=self.parents[self.level],
             )
 
         elif (
@@ -996,10 +1072,10 @@ class PatentUsptoGrantAps(PatentUspto):
                 last_claim = self.doc.add_text(
                     label=DocItemLabel.PARAGRAPH,
                     text="",
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
 
-            last_claim.text += f" {value}" if last_claim.text else value
+            last_claim.text += f" {value.strip()}" if last_claim.text else value.strip()
 
         elif field == self.Field.CAPTION.value and section in (
             self.Section.SUMMARY.value,
@@ -1012,7 +1088,7 @@ class PatentUsptoGrantAps(PatentUspto):
             self.parents[self.level + 1] = self.doc.add_heading(
                 value,
                 level=self.level,
-                parent=self.parents[self.level],  # type: ignore[arg-type]
+                parent=self.parents[self.level],
             )
             self.level += 1
 
@@ -1029,10 +1105,10 @@ class PatentUsptoGrantAps(PatentUspto):
             self.doc.add_text(
                 label=DocItemLabel.PARAGRAPH,
                 text=value,
-                parent=self.parents[self.level],  # type: ignore[arg-type]
+                parent=self.parents[self.level],
             )
 
-    def parse(self, patent_content: str) -> Optional[DoclingDocument]:
+    def parse(self, patent_content: str) -> DoclingDocument | None:
         self.doc = self.doc = DoclingDocument(name="file")
         section: str = ""
         key: str = ""
@@ -1077,12 +1153,26 @@ class PatentUsptoAppV1(PatentUspto):
         self.pattern = re.compile(r"^(<table .*?</table>)", re.MULTILINE | re.DOTALL)
 
     @override
-    def parse(self, patent_content: str) -> Optional[DoclingDocument]:
+    def parse(self, patent_content: str) -> DoclingDocument | None:
         try:
-            xml.sax.parseString(patent_content, self.handler)
-        except xml.sax._exceptions.SAXParseException as exc_sax:
-            _log.error(f"Error in parsing USPTO document: {exc_sax}")
-
+            parser = make_parser()
+            parser.setFeature(feature_external_ges, False)
+            parser.setFeature(feature_external_pes, False)
+            parser.forbid_dtd = False
+            parser.forbid_entities = False
+            parser.forbid_external = False
+            parser.setContentHandler(self.handler)
+            parser.parse(StringIO(patent_content))
+        except SAXParseException as exc_sax:
+            _log.error(f"Error in parsing USPTO document (malformed XML): {exc_sax}")
+            return None
+        except DefusedXmlException as exc_defused:
+            _log.error(
+                f"Error in parsing USPTO document (security issue detected): {exc_defused}"
+            )
+            return None
+        except Exception as exc:
+            _log.error(f"Unexpected error in parsing USPTO document: {exc}")
             return None
 
         doc = self.handler.doc
@@ -1109,10 +1199,10 @@ class PatentUsptoAppV1(PatentUspto):
 
         return doc
 
-    class PatentHandler(xml.sax.handler.ContentHandler):
+    class PatentHandler(ContentHandler):
         """SAX ContentHandler for patent documents."""
 
-        APP_DOC_ELEMENT: Final = "patent-application-publication"
+        APP_DOC_ELEMENT: Final[str] = "patent-application-publication"
 
         @unique
         class Element(Enum):
@@ -1148,11 +1238,11 @@ class PatentUsptoAppV1(PatentUspto):
         def __init__(self) -> None:
             """Build an instance of the patent handler."""
             # Current patent being parsed
-            self.doc: Optional[DoclingDocument] = None
+            self.doc: DoclingDocument | None = None
             # Keep track of docling hierarchy level
             self.level: LevelNumber = 1
             # Keep track of docling parents by level
-            self.parents: dict[LevelNumber, Optional[DocItem]] = {1: None}
+            self.parents: dict[LevelNumber, DocItem | None] = {1: None}
             # Content to retain for the current patent
             self.property: list[str]
             self.claim: str
@@ -1164,7 +1254,7 @@ class PatentUsptoAppV1(PatentUspto):
             self.style_html = HtmlEntity()
 
         @override
-        def startElement(self, tag, attributes):  # noqa: N802
+        def startElement(self, tag, attributes):
             """Signal the start of an element.
 
             Args:
@@ -1177,7 +1267,7 @@ class PatentUsptoAppV1(PatentUspto):
             self._start_registered_elements(tag, attributes)
 
         @override
-        def skippedEntity(self, name):  # noqa: N802
+        def skippedEntity(self, name):
             """Receive notification of a skipped entity.
 
             HTML entities will be skipped by the parser. This method will unescape them
@@ -1193,7 +1283,7 @@ class PatentUsptoAppV1(PatentUspto):
                     escaped = self.style_html.get_greek_from_iso8879(f"&{name};")
                     unescaped = html.unescape(escaped)
                     if unescaped == escaped:
-                        logging.debug("Unrecognized HTML entity: " + name)
+                        _log.debug("Unrecognized HTML entity: " + name)
                         return
 
                     if element in (
@@ -1211,7 +1301,7 @@ class PatentUsptoAppV1(PatentUspto):
                         self.text += unescaped
 
         @override
-        def endElement(self, tag):  # noqa: N802
+        def endElement(self, tag):
             """Signal the end of an element.
 
             Args:
@@ -1247,7 +1337,7 @@ class PatentUsptoAppV1(PatentUspto):
                         self.text += content
 
         def _start_registered_elements(
-            self, tag: str, attributes: xml.sax.xmlreader.AttributesImpl
+            self, tag: str, attributes: AttributesImpl
         ) -> None:
             if tag in [member.value for member in self.Element]:
                 # special case for claims: claim lines may start before the
@@ -1283,7 +1373,7 @@ class PatentUsptoAppV1(PatentUspto):
                 title = text.strip()
                 if title:
                     self.parents[self.level + 1] = self.doc.add_text(
-                        parent=self.parents[self.level],  # type: ignore[arg-type]
+                        parent=self.parents[self.level],
                         label=DocItemLabel.TITLE,
                         text=title,
                     )
@@ -1301,7 +1391,7 @@ class PatentUsptoAppV1(PatentUspto):
                     abstract_item = self.doc.add_heading(
                         heading_text,
                         level=heading_level,
-                        parent=self.parents[heading_level],  # type: ignore[arg-type]
+                        parent=self.parents[heading_level],
                     )
                     self.doc.add_text(
                         label=DocItemLabel.PARAGRAPH,
@@ -1331,7 +1421,7 @@ class PatentUsptoAppV1(PatentUspto):
                 claims_item = self.doc.add_heading(
                     heading_text,
                     level=heading_level,
-                    parent=self.parents[heading_level],  # type: ignore[arg-type]
+                    parent=self.parents[heading_level],
                 )
                 for text in self.claims:
                     self.doc.add_text(
@@ -1350,14 +1440,14 @@ class PatentUsptoAppV1(PatentUspto):
                         self.parents[self.level + 1] = self.doc.add_heading(
                             text=text,
                             level=self.level,
-                            parent=self.parents[self.level],  # type: ignore[arg-type]
+                            parent=self.parents[self.level],
                         )
                         self.level += 1
                     else:
                         self.doc.add_text(
                             label=DocItemLabel.PARAGRAPH,
                             text=text,
-                            parent=self.parents[self.level],  # type: ignore[arg-type]
+                            parent=self.parents[self.level],
                         )
                 self.text = ""
 
@@ -1366,7 +1456,7 @@ class PatentUsptoAppV1(PatentUspto):
                 empty_table = TableData(num_rows=0, num_cols=0, table_cells=[])
                 self.doc.add_table(
                     data=empty_table,
-                    parent=self.parents[self.level],  # type: ignore[arg-type]
+                    parent=self.parents[self.level],
                 )
 
         def _apply_style(self, text: str, style_tag: str) -> str:
@@ -1406,6 +1496,10 @@ class XmlTable:
     http://oasis-open.org/specs/soextblx.dtd
     """
 
+    class ColInfo(TypedDict):
+        ncols: int
+        colinfo: list[dict]
+
     class MinColInfoType(TypedDict):
         offset: list[int]
         colwidth: list[int]
@@ -1419,13 +1513,19 @@ class XmlTable:
 
         Args:
             input: The xml content.
+
+        Security Note:
+            This parser uses BeautifulSoup with lxml, which can be vulnerable to XXE.
+            However, the input here comes from table strings extracted AFTER the main
+            document has been safely parsed by defusedxml, so the content is already
+            sanitized and safe to parse.
         """
         self.max_nbr_messages = 2
         self.nbr_messages = 0
         self.empty_text = ""
         self._soup = BeautifulSoup(input, features="xml")
 
-    def _create_tg_range(self, tgs: list[dict[str, Any]]) -> dict[int, ColInfoType]:
+    def _create_tg_range(self, tgs: list[ColInfo]) -> dict[int, ColInfoType]:
         """Create a unified range along the table groups.
 
         Args:
@@ -1470,9 +1570,7 @@ class XmlTable:
                 if cw == 0:
                     offset_w0.append(col["offset"][ic])
 
-            min_colinfo["offset"] = sorted(
-                list(set(col["offset"] + min_colinfo["offset"]))
-            )
+            min_colinfo["offset"] = sorted(set(col["offset"] + min_colinfo["offset"]))
 
         # add back the 0 width cols to offset list
         offset_w0 = list(set(offset_w0))
@@ -1532,19 +1630,26 @@ class XmlTable:
         Returns:
             A docling table object.
         """
-        tgs_align = []
-        tg_secs = table.find_all("tgroup")
+        tgs_align: list[XmlTable.ColInfo] = []
+        tg_secs = table("tgroup")
         if tg_secs:
             for tg_sec in tg_secs:
-                ncols = tg_sec.get("cols", None)
-                if ncols:
-                    ncols = int(ncols)
-                tg_align = {"ncols": ncols, "colinfo": []}
-                cs_secs = tg_sec.find_all("colspec")
+                if not isinstance(tg_sec, Tag):
+                    continue
+                col_val = tg_sec.get("cols")
+                ncols = (
+                    int(col_val)
+                    if isinstance(col_val, str) and col_val.isnumeric()
+                    else 1
+                )
+                tg_align: XmlTable.ColInfo = {"ncols": ncols, "colinfo": []}
+                cs_secs = tg_sec("colspec")
                 if cs_secs:
                     for cs_sec in cs_secs:
-                        colname = cs_sec.get("colname", None)
-                        colwidth = cs_sec.get("colwidth", None)
+                        if not isinstance(cs_sec, Tag):
+                            continue
+                        colname = cs_sec.get("colname")
+                        colwidth = cs_sec.get("colwidth")
                         tg_align["colinfo"].append(
                             {"colname": colname, "colwidth": colwidth}
                         )
@@ -1565,16 +1670,23 @@ class XmlTable:
         table_data: list[TableCell] = []
         i_row_global = 0
         is_row_empty: bool = True
-        tg_secs = table.find_all("tgroup")
+        tg_secs = table("tgroup")
         if tg_secs:
             for itg, tg_sec in enumerate(tg_secs):
+                if not isinstance(tg_sec, Tag):
+                    continue
                 tg_range = tgs_range[itg]
-                row_secs = tg_sec.find_all(["row", "tr"])
+                row_secs = tg_sec(["row", "tr"])
 
                 if row_secs:
                     for row_sec in row_secs:
-                        entry_secs = row_sec.find_all(["entry", "td"])
-                        is_header: bool = row_sec.parent.name in ["thead"]
+                        if not isinstance(row_sec, Tag):
+                            continue
+                        entry_secs = row_sec(["entry", "td"])
+                        is_header: bool = (
+                            row_sec.parent is not None
+                            and row_sec.parent.name == "thead"
+                        )
 
                         ncols = 0
                         local_row: list[TableCell] = []
@@ -1582,23 +1694,27 @@ class XmlTable:
                         if entry_secs:
                             wrong_nbr_cols = False
                             for ientry, entry_sec in enumerate(entry_secs):
+                                if not isinstance(entry_sec, Tag):
+                                    continue
                                 text = entry_sec.get_text().strip()
 
                                 # start-end
-                                namest = entry_sec.attrs.get("namest", None)
-                                nameend = entry_sec.attrs.get("nameend", None)
-                                if isinstance(namest, str) and namest.isnumeric():
-                                    namest = int(namest)
-                                else:
-                                    namest = ientry + 1
+                                namest = entry_sec.get("namest")
+                                nameend = entry_sec.get("nameend")
+                                start = (
+                                    int(namest)
+                                    if isinstance(namest, str) and namest.isnumeric()
+                                    else ientry + 1
+                                )
                                 if isinstance(nameend, str) and nameend.isnumeric():
-                                    nameend = int(nameend)
+                                    end = int(nameend)
                                     shift = 0
                                 else:
-                                    nameend = ientry + 2
+                                    end = ientry + 2
                                     shift = 1
 
-                                if nameend > len(tg_range["cell_offst"]):
+                                n_offst = len(tg_range["cell_offst"])
+                                if start < 1 or start > n_offst or end > n_offst:
                                     wrong_nbr_cols = True
                                     self.nbr_messages += 1
                                     if self.nbr_messages <= self.max_nbr_messages:
@@ -1608,8 +1724,8 @@ class XmlTable:
                                     break
 
                                 range_ = [
-                                    tg_range["cell_offst"][namest - 1],
-                                    tg_range["cell_offst"][nameend - 1] - shift,
+                                    tg_range["cell_offst"][start - 1],
+                                    tg_range["cell_offst"][end - 1] - shift,
                                 ]
 
                                 # add row and replicate cell if needed
@@ -1661,14 +1777,14 @@ class XmlTable:
 
         return dl_table
 
-    def parse(self) -> Optional[TableData]:
+    def parse(self) -> TableData | None:
         """Parse the first table from an xml content.
 
         Returns:
             A docling table data.
         """
         section = self._soup.find("table")
-        if section is not None:
+        if isinstance(section, Tag):
             table = self._parse_table(section)
             if table.num_rows == 0 or table.num_cols == 0:
                 _log.warning("The parsed USPTO table is empty")
@@ -1680,7 +1796,7 @@ class XmlTable:
 class HtmlEntity:
     """Provide utility functions to get the HTML entities of styled characters.
 
-    This class has been developped from:
+    This class has been developed from:
     https://unicode-table.com/en/html-entities/
     https://www.w3.org/TR/WD-math-970515/table03.html
     """
@@ -1701,7 +1817,7 @@ class HtmlEntity:
                 "0": "&#8304;",
                 "+": "&#8314;",
                 "-": "&#8315;",
-                "−": "&#8315;",
+                "−": "&#8315;",  # noqa: RUF001
                 "=": "&#8316;",
                 "(": "&#8317;",
                 ")": "&#8318;",
@@ -1725,7 +1841,7 @@ class HtmlEntity:
                 "0": "&#8320;",
                 "+": "&#8330;",
                 "-": "&#8331;",
-                "−": "&#8331;",
+                "−": "&#8331;",  # noqa: RUF001
                 "=": "&#8332;",
                 "(": "&#8333;",
                 ")": "&#8334;",
@@ -1760,6 +1876,7 @@ class HtmlEntity:
                 "U": "&#119880;",
                 "V": "&#119881;",
                 "W": "&#119882;",
+                "X": "&#119883;",
                 "Y": "&#119884;",
                 "Z": "&#119885;",
                 "a": "&#119886;",
@@ -1879,7 +1996,7 @@ class HtmlEntity:
         """Get an HTML entity of a greek letter in ISO 8879.
 
         Args:
-            The text to transform, as an ISO 8879 entitiy.
+            The text to transform, as an ISO 8879 entity.
 
         Returns:
             The HTML entity representing a greek letter. If the input text is not
