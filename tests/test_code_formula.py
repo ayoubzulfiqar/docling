@@ -1,19 +1,19 @@
 from pathlib import Path
 
+import pytest
 from docling_core.types.doc import CodeItem, TextItem
 from docling_core.types.doc.labels import CodeLanguageLabel, DocItemLabel
 
-from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
-from docling.backend.docling_parse_v2_backend import DoclingParseV2DocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
 
+pytestmark = pytest.mark.ml_pdf_model
+
 
 def get_converter():
-
     pipeline_options = PdfPipelineOptions()
     pipeline_options.generate_page_images = True
 
@@ -25,7 +25,6 @@ def get_converter():
     converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(
-                backend=DoclingParseV2DocumentBackend,
                 pipeline_cls=StandardPdfPipeline,
                 pipeline_options=pipeline_options,
             )
@@ -36,7 +35,7 @@ def get_converter():
 
 
 def test_code_and_formula_conversion():
-    pdf_path = Path("tests/data/pdf/code_and_formula.pdf")
+    pdf_path = Path("tests/data/pdf/sources/code_and_formula.pdf")
     converter = get_converter()
 
     print(f"converting {pdf_path}")
@@ -53,6 +52,28 @@ def test_code_and_formula_conversion():
     predicted = code_blocks[0].text.strip()
     assert predicted == gt, f"mismatch in text {predicted=}, {gt=}"
     assert code_blocks[0].code_language == CodeLanguageLabel.JAVASCRIPT
+
+    formula_blocks = [
+        el
+        for el in results
+        if isinstance(el, TextItem) and el.label == DocItemLabel.FORMULA
+    ]
+    assert len(formula_blocks) == 1
+
+    gt = "a ^ { 2 } + 8 = 1 2"
+    predicted = formula_blocks[0].text
+    assert predicted == gt, f"mismatch in text {predicted=}, {gt=}"
+
+
+def test_formula_conversion_with_page_range():
+    pdf_path = Path("tests/data/pdf/sources/code_and_formula.pdf")
+    converter = get_converter()
+
+    print(f"converting {pdf_path} with page range")
+
+    doc_result: ConversionResult = converter.convert(pdf_path, page_range=(2, 2))
+
+    results = doc_result.document.texts
 
     formula_blocks = [
         el

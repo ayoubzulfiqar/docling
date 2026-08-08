@@ -1,8 +1,11 @@
+from pathlib import Path, PurePath
+
 from docling_core.types.doc import DocItemLabel
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageFont import FreeTypeFont
 
-from docling.datamodel.base_models import Cluster
+from docling.datamodel.base_models import Cluster, Page
+from docling.datamodel.settings import settings
 
 
 def draw_clusters(
@@ -25,10 +28,10 @@ def draw_clusters(
             # Draw cells first (underneath)
             cell_color = (0, 0, 0, 40)  # Transparent black for cells
             for tc in c.cells:
-                cx0, cy0, cx1, cy1 = tc.bbox.as_tuple()
+                cx0, cy0, cx1, cy1 = tc.rect.to_bounding_box().as_tuple()
                 cx0 *= scale_x
                 cx1 *= scale_x
-                cy0 *= scale_x
+                cy0 *= scale_y
                 cy1 *= scale_y
 
                 draw.rectangle(
@@ -40,8 +43,13 @@ def draw_clusters(
             x0, y0, x1, y1 = c.bbox.as_tuple()
             x0 *= scale_x
             x1 *= scale_x
-            y0 *= scale_x
+            y0 *= scale_y
             y1 *= scale_y
+
+            if y1 <= y0:
+                y1, y0 = y0, y1
+            if x1 <= x0:
+                x1, x0 = x0, x1
 
             cluster_fill_color = (*list(DocItemLabel.get_color(c.label)), 70)
             cluster_outline_color = (
@@ -78,3 +86,53 @@ def draw_clusters(
                 fill=(0, 0, 0, 255),  # Solid black
                 font=font,
             )
+
+
+def draw_clusters_and_cells_side_by_side(
+    input_file: PurePath,
+    page: Page,
+    clusters: list[Cluster],
+    mode_prefix: str,
+    show: bool = False,
+) -> None:
+    """
+    Draws a page image side by side with clusters filtered into two categories:
+    - Left: Clusters excluding FORM, KEY_VALUE_REGION, and PICTURE.
+    - Right: Clusters including FORM, KEY_VALUE_REGION, and PICTURE.
+    Includes label names and confidence scores for each cluster.
+    """
+    assert page.image is not None
+    assert page.size is not None
+    scale_x = page.image.width / page.size.width
+    scale_y = page.image.height / page.size.height
+
+    # Filter clusters for left and right images
+    exclude_labels = {
+        DocItemLabel.FORM,
+        DocItemLabel.KEY_VALUE_REGION,
+        DocItemLabel.PICTURE,
+    }
+    left_clusters = [c for c in clusters if c.label not in exclude_labels]
+    right_clusters = [c for c in clusters if c.label in exclude_labels]
+    # Create a deep copy of the original image for both sides
+    left_image = page.image.copy()
+    right_image = page.image.copy()
+
+    # Draw clusters on both images
+    draw_clusters(left_image, left_clusters, scale_x, scale_y)
+    draw_clusters(right_image, right_clusters, scale_x, scale_y)
+    # Combine the images side by side
+    combined_width = left_image.width * 2
+    combined_height = left_image.height
+    combined_image = Image.new("RGB", (combined_width, combined_height))
+    combined_image.paste(left_image, (0, 0))
+    combined_image.paste(right_image, (left_image.width, 0))
+    if show:
+        combined_image.show()
+    else:
+        out_path: Path = (
+            Path(settings.debug.debug_output_path) / f"debug_{input_file.stem}"
+        )
+        out_path.mkdir(parents=True, exist_ok=True)
+        out_file = out_path / f"{mode_prefix}_layout_page_{page.page_no:05}.png"
+        combined_image.save(str(out_file), format="png")

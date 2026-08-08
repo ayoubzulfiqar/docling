@@ -2,7 +2,7 @@ import logging
 import re
 from io import BytesIO
 from pathlib import Path
-from typing import Set, Union
+from typing import Final, Union
 
 from docling_core.types.doc import (
     DocItemLabel,
@@ -19,12 +19,20 @@ from docling_core.types.doc import (
 from docling.backend.abstract_backend import DeclarativeDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
+from docling.exceptions import DocumentLoadError
 
 _log = logging.getLogger(__name__)
 
+DEFAULT_IMAGE_WIDTH: Final = 128
+DEFAULT_IMAGE_HEIGHT: Final = 128
+
+# Cell format specifier that may precede a "|" delimiter, e.g. "^.^h" in
+# "^.^h|Header": span (3*, 2+), alignment (<, ^, >, .^), style (a/d/e/h/l/m/s).
+_CELL_SPEC: Final = r"(?:\d+(?:\.\d+)?[*+])*[<^>]?(?:\.[<^>])?[adehlms]?"
+
 
 class AsciiDocBackend(DeclarativeDocumentBackend):
-    def __init__(self, in_doc: InputDocument, path_or_stream: Union[BytesIO, Path]):
+    def __init__(self, in_doc: "InputDocument", path_or_stream: Union[BytesIO, Path]):
         super().__init__(in_doc, path_or_stream)
 
         self.path_or_stream = path_or_stream
@@ -34,12 +42,12 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                 text_stream = self.path_or_stream.getvalue().decode("utf-8")
                 self.lines = text_stream.split("\n")
             if isinstance(self.path_or_stream, Path):
-                with open(self.path_or_stream, "r", encoding="utf-8") as f:
+                with open(self.path_or_stream, encoding="utf-8") as f:
                     self.lines = f.readlines()
             self.valid = True
 
         except Exception as e:
-            raise RuntimeError(
+            raise DocumentLoadError(
                 f"Could not initialize AsciiDoc backend for file with hash {self.document_hash}."
             ) from e
         return
@@ -55,7 +63,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         return
 
     @classmethod
-    def supported_formats(cls) -> Set[InputFormat]:
+    def supported_formats(cls) -> set[InputFormat]:
         return {InputFormat.ASCIIDOC}
 
     def convert(self) -> DoclingDocument:
@@ -81,8 +89,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         title, section headers, text, lists, and tables.
         """
 
-        content = ""
-
         in_list = False
         in_table = False
 
@@ -95,7 +101,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         # indents: dict[int, Union[DocItem, GroupItem, None]] = {}
         indents: dict[int, Union[GroupItem, None]] = {}
 
-        for i in range(0, 10):
+        for i in range(10):
             parents[i] = None
             indents[i] = None
 
@@ -125,7 +131,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
 
             # Lists
             elif self._is_list_item(line):
-
                 _log.debug(f"line: {line}")
                 item = self._parse_list_item(line)
                 _log.debug(f"parsed list-item: {item}")
@@ -147,7 +152,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                     indents[level + 1] = item["indent"]
 
                 elif in_list and item["indent"] < indents[level]:
-
                     # print(item["indent"], " => ", indents[level])
                     while item["indent"] < indents[level]:
                         # print(item["indent"], " => ", indents[level])
@@ -176,7 +180,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
             elif in_table and (
                 (not self._is_table_line(line)) or line.strip() == "|==="
             ):  # end of table
-
                 caption = None
                 if len(caption_data) > 0:
                     caption = doc.add_text(
@@ -195,7 +198,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
 
             # Picture
             elif self._is_picture(line):
-
                 caption = None
                 if len(caption_data) > 0:
                     caption = doc.add_text(
@@ -206,9 +208,12 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
 
                 item = self._parse_picture(line)
 
-                size = None
-                if "width" in item and "height" in item:
+                size: Size
+                try:
                     size = Size(width=int(item["width"]), height=int(item["height"]))
+                except (KeyError, ValueError):
+                    # width/height may be absent or non-numeric (e.g. "50%", "auto")
+                    size = Size(width=DEFAULT_IMAGE_WIDTH, height=DEFAULT_IMAGE_HEIGHT)
 
                 uri = None
                 if (
@@ -250,7 +255,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                 text_data = []
 
             elif len(line.strip()) > 0:  # allow multiline texts
-
                 item = self._parse_text(line)
                 text_data.append(item["text"])
 
@@ -271,32 +275,38 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
 
         return doc
 
-    def _get_current_level(self, parents):
+    @staticmethod
+    def _get_current_level(parents):
         for k, v in parents.items():
-            if v == None and k > 0:
+            if v is None and k > 0:
                 return k - 1
 
         return 0
 
-    def _get_current_parent(self, parents):
+    @staticmethod
+    def _get_current_parent(parents):
         for k, v in parents.items():
-            if v == None and k > 0:
+            if v is None and k > 0:
                 return parents[k - 1]
 
         return None
 
     #   =========   Title
-    def _is_title(self, line):
+    @staticmethod
+    def _is_title(line):
         return re.match(r"^= ", line)
 
-    def _parse_title(self, line):
+    @staticmethod
+    def _parse_title(line):
         return {"type": "title", "text": line[2:].strip(), "level": 0}
 
     #   =========   Section headers
-    def _is_section_header(self, line):
-        return re.match(r"^==+", line)
+    @staticmethod
+    def _is_section_header(line):
+        return re.match(r"^==+\s+", line)
 
-    def _parse_section_header(self, line):
+    @staticmethod
+    def _parse_section_header(line):
         match = re.match(r"^(=+)\s+(.*)", line)
 
         marker = match.group(1)  # The list marker (e.g., "*", "-", "1.")
@@ -310,10 +320,12 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         }
 
     #   =========   Lists
-    def _is_list_item(self, line):
+    @staticmethod
+    def _is_list_item(line):
         return re.match(r"^(\s)*(\*|-|\d+\.|\w+\.) ", line)
 
-    def _parse_list_item(self, line):
+    @staticmethod
+    def _parse_list_item(line):
         """Extract the item marker (number or bullet symbol) and the text of the item."""
 
         match = re.match(r"^(\s*)(\*|-|\d+\.)\s+(.*)", line)
@@ -328,7 +340,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                     "marker": marker,
                     "text": text.strip(),
                     "numbered": False,
-                    "indent": 0 if indent == None else len(indent),
+                    "indent": 0 if indent is None else len(indent),
                 }
             else:
                 return {
@@ -336,7 +348,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                     "marker": marker,
                     "text": text.strip(),
                     "numbered": True,
-                    "indent": 0 if indent == None else len(indent),
+                    "indent": 0 if indent is None else len(indent),
                 }
         else:
             # Fallback if no match
@@ -349,19 +361,26 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
             }
 
     #   =========   Tables
-    def _is_table_line(self, line):
-        return re.match(r"^\|.*\|", line)
+    @staticmethod
+    def _is_table_line(line):
+        return re.match(rf"^{_CELL_SPEC}\|.*\|", line)
 
-    def _parse_table_line(self, line):
-        # Split table cells and trim extra spaces
-        return [cell.strip() for cell in line.split("|") if cell.strip()]
+    @staticmethod
+    def _parse_table_line(line):
+        # Drop cell specifiers glued to a "|" (e.g. "^.^h"); anchored to
+        # whitespace so content ending in a style letter (e.g. "Eth") survives.
+        line = re.sub(rf"(^|\s){_CELL_SPEC}(?=\|)", r"\1", line)
+        # Split by "|" and remove the leading empty string from the first "|"
+        cells = line.split("|")[1:]
+        # Strip whitespace from each cell (empty cells become empty strings)
+        return [cell.strip() for cell in cells]
 
-    def _populate_table_as_grid(self, table_data):
-
+    @staticmethod
+    def _populate_table_as_grid(table_data):
         num_rows = len(table_data)
 
         # Adjust the table data into a grid format
-        num_cols = max(len(row) for row in table_data)
+        num_cols = max((len(row) for row in table_data), default=0)
 
         data = TableData(num_rows=num_rows, num_cols=num_cols, table_cells=[])
         for row_idx, row in enumerate(table_data):
@@ -380,7 +399,7 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
                     end_row_offset_idx=row_idx + row_span,
                     start_col_offset_idx=col_idx,
                     end_col_offset_idx=col_idx + col_span,
-                    col_header=False,
+                    column_header=row_idx == 0,
                     row_header=False,
                 )
                 data.table_cells.append(cell)
@@ -388,10 +407,12 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         return data
 
     #   =========   Pictures
-    def _is_picture(self, line):
+    @staticmethod
+    def _is_picture(line):
         return re.match(r"^image::", line)
 
-    def _parse_picture(self, line):
+    @staticmethod
+    def _parse_picture(line):
         """
         Parse an image macro, extracting its path and attributes.
         Syntax: image::path/to/image.png[Alt Text, width=200, height=150, align=center]
@@ -404,20 +425,26 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
 
             # Extract optional attributes (alt text, width, height, alignment)
             if attributes:
-                picture_info["alt"] = attributes[0].strip() if attributes[0] else ""
+                alt_parts = [attributes[0].strip()] if attributes[0] else [""]
                 for attr in attributes[1:]:
-                    key, value = attr.split("=")
-                    picture_info[key.strip()] = value.strip()
+                    if "=" in attr:
+                        key, value = attr.split("=", 1)
+                        picture_info[key.strip()] = value.strip()
+                    else:
+                        alt_parts.append(attr.strip())
+                picture_info["alt"] = ", ".join(alt_parts)
 
             return picture_info
 
         return {"type": "picture", "uri": line}
 
     #   =========   Captions
-    def _is_caption(self, line):
+    @staticmethod
+    def _is_caption(line):
         return re.match(r"^\.(.+)", line)
 
-    def _parse_caption(self, line):
+    @staticmethod
+    def _parse_caption(line):
         mtch = re.match(r"^\.(.+)", line)
         if mtch:
             text = mtch.group(1)
@@ -426,5 +453,6 @@ class AsciiDocBackend(DeclarativeDocumentBackend):
         return {"type": "caption", "text": ""}
 
     #   =========   Plain text
-    def _parse_text(self, line):
+    @staticmethod
+    def _parse_text(line):
         return {"type": "text", "text": line.strip()}

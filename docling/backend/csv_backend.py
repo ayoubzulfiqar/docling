@@ -10,6 +10,7 @@ from docling_core.types.doc import DoclingDocument, DocumentOrigin, TableCell, T
 from docling.backend.abstract_backend import DeclarativeDocumentBackend
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
+from docling.exceptions import DocumentLoadError
 
 _log = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ class CsvDocumentBackend(DeclarativeDocumentBackend):
                 self.content = StringIO(self.path_or_stream.read_text("utf-8"))
             self.valid = True
         except Exception as e:
-            raise RuntimeError(
+            raise DocumentLoadError(
                 f"CsvDocumentBackend could not load document with hash {self.document_hash}"
             ) from e
         return
@@ -56,28 +57,26 @@ class CsvDocumentBackend(DeclarativeDocumentBackend):
 
         # Detect CSV dialect
         head = self.content.readline()
-        dialect = csv.Sniffer().sniff(head, ",;\t|:")
-        _log.info(f'Parsing CSV with delimiter: "{dialect.delimiter}"')
-        if not dialect.delimiter in {",", ";", "\t", "|", ":"}:
-            raise RuntimeError(
-                f"Cannot convert csv with unknown delimiter {dialect.delimiter}."
+        try:
+            dialect: type[csv.Dialect] = csv.Sniffer().sniff(head, ",;\t|:")
+            if dialect.delimiter not in {",", ";", "\t", "|", ":"}:
+                raise RuntimeError(
+                    f"Cannot convert csv with unknown delimiter {dialect.delimiter}."
+                )
+            else:
+                _log.info(f'Parsing CSV with delimiter: "{dialect.delimiter}"')
+        except csv.Error as e:
+            # Fall back to default commad delimiter (e.g. single-column, insufficient data to detect)
+            _log.info(
+                f"Could not detect delimiter ({e}), using default comma delimiter"
             )
+            dialect = csv.excel
 
-        # Parce CSV
+        # Parse CSV
         self.content.seek(0)
         result = csv.reader(self.content, dialect=dialect, strict=True)
         self.csv_data = list(result)
         _log.info(f"Detected {len(self.csv_data)} lines")
-
-        # Ensure uniform column length
-        expected_length = len(self.csv_data[0])
-        is_uniform = all(len(row) == expected_length for row in self.csv_data)
-        if not is_uniform:
-            warnings.warn(
-                f"Inconsistent column lengths detected in CSV data. "
-                f"Expected {expected_length} columns, but found rows with varying lengths. "
-                f"Ensure all rows have the same number of columns."
-            )
 
         # Parse the CSV into a structured document model
         origin = DocumentOrigin(
@@ -90,7 +89,18 @@ class CsvDocumentBackend(DeclarativeDocumentBackend):
 
         if self.is_valid():
             # Convert CSV data to table
-            if self.csv_data:
+            if not self.csv_data:
+                _log.warning("CSV file is empty, returning empty document.")
+            else:
+                expected_length = len(self.csv_data[0])
+                is_uniform = all(len(row) == expected_length for row in self.csv_data)
+                if not is_uniform:
+                    warnings.warn(
+                        f"Inconsistent column lengths detected in CSV data. "
+                        f"Expected {expected_length} columns, but found rows with varying lengths. "
+                        f"Ensure all rows have the same number of columns."
+                    )
+
                 num_rows = len(self.csv_data)
                 num_cols = max(len(row) for row in self.csv_data)
 
@@ -111,7 +121,7 @@ class CsvDocumentBackend(DeclarativeDocumentBackend):
                             end_row_offset_idx=row_idx + 1,
                             start_col_offset_idx=col_idx,
                             end_col_offset_idx=col_idx + 1,
-                            col_header=row_idx == 0,  # First row as header
+                            column_header=row_idx == 0,  # First row as header
                             row_header=False,
                         )
                         table_data.table_cells.append(cell)

@@ -1,6 +1,26 @@
+# %% [markdown]
+# Developing an enrichment model example (formula understanding: scaffold only).
+#
+# What this example does
+# - Shows how to define pipeline options, an enrichment model, and extend a pipeline.
+# - Displays cropped images of formula items and yields them back unchanged.
+#
+# Important
+# - This is a development scaffold; it does not run a real formula understanding model.
+#
+# How to run
+# - From the repo root: `python docs/examples/develop_formula_understanding.py`.
+#
+# Notes
+# - Set `do_formula_understanding=True` to enable the example enrichment stage.
+# - Extends `StandardPdfPipeline` and keeps the backend when enrichment is enabled.
+
+# %%
+
 import logging
+import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from docling_core.types.doc import DocItemLabel, DoclingDocument, NodeItem, TextItem
 
@@ -9,6 +29,9 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.models.base_model import BaseItemAndImageEnrichmentModel
 from docling.pipeline.standard_pdf_pipeline import StandardPdfPipeline
+
+# Check if running in CI
+IS_CI = os.environ.get("CI", "").lower() in ("true", "1", "yes")
 
 
 class ExampleFormulaUnderstandingPipelineOptions(PdfPipelineOptions):
@@ -38,14 +61,16 @@ class ExampleFormulaUnderstandingEnrichmentModel(BaseItemAndImageEnrichmentModel
             return
 
         for enrich_element in element_batch:
-            enrich_element.image.show()
+            if not IS_CI:
+                # Opens a window for each cropped formula image; comment this out when
+                # running headless or processing many items to avoid blocking spam.
+                enrich_element.image.show()
 
             yield enrich_element.item
 
 
 # How the pipeline can be extended.
 class ExampleFormulaUnderstandingPipeline(StandardPdfPipeline):
-
     def __init__(self, pipeline_options: ExampleFormulaUnderstandingPipelineOptions):
         super().__init__(pipeline_options)
         self.pipeline_options: ExampleFormulaUnderstandingPipelineOptions
@@ -68,7 +93,8 @@ class ExampleFormulaUnderstandingPipeline(StandardPdfPipeline):
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    input_doc_path = Path("./tests/data/pdf/2203.01017v2.pdf")
+    data_folder = Path(__file__).parent / "../../tests/data"
+    input_doc_path = data_folder / "pdf/sources/code_and_formula.pdf"
 
     pipeline_options = ExampleFormulaUnderstandingPipelineOptions()
     pipeline_options.do_formula_understanding = True
@@ -81,7 +107,7 @@ def main():
             )
         }
     )
-    result = doc_converter.convert(input_doc_path)
+    doc_converter.convert(input_doc_path)
 
 
 if __name__ == "__main__":
